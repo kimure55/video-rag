@@ -50,7 +50,21 @@ def update_status(**kwargs):
 
 @router.get("/status")
 async def get_status():
-    return process_status
+    result = {
+        "is_processing": process_status["is_processing"],
+        "current_video": process_status["current_video"],
+        "current_video_index": process_status["current_video_index"],
+        "total_videos": process_status["total_videos"],
+        "current_frame_index": process_status["current_frame_index"],
+        "processed_videos": process_status["processed_videos"],
+        "processed_frames": process_status["processed_frames"],
+        "status": process_status["status"],
+        "message": process_status["message"],
+        "start_time": process_status["start_time"],
+        "error": process_status["error"]
+    }
+    print(f"📊 Status poll: {result}")
+    return result
 
 
 @router.post("/", response_model=ProcessResponse)

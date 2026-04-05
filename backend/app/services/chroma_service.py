@@ -127,7 +127,7 @@ class ChromaService:
                         "timestamp": results["metadatas"][0][i].get("timestamp", 0.0),
                         "start_time": results["metadatas"][0][i].get("start_time", 0.0),
                         "end_time": results["metadatas"][0][i].get("end_time", 0.0),
-                        "score": float(results["distances"][0][i]) if results.get("distances") else 0.0
+                        "distance": float(results["distances"][0][i]) if results.get("distances") else 1.0
                     })
 
             return search_results
@@ -246,7 +246,43 @@ class VideoProcessor:
             print(f"❌ 获取视频时长失败: {e}")
             return 60
 
-    def _extract_frame_as_gray(self, video_path: str, timestamp: float, output_path: str) -> Optional[np.ndarray]:
+    def _extract_frame(self, video_path: str, timestamp: float, output_path: str) -> Optional[np.ndarray]:
+        abs_video_path = os.path.normpath(video_path)
+        abs_output_path = os.path.normpath(output_path)
+
+        os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
+
+        try:
+            cap = cv2.VideoCapture(abs_video_path)
+            if not cap.isOpened():
+                print(f"❌ OpenCV 无法打开视频: {abs_video_path}")
+                return None
+
+            cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret or frame is None:
+                print(f"❌ 无法读取帧 (timestamp={timestamp})")
+                return None
+
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+            success, buffer = cv2.imencode('.jpg', frame, encode_param)
+
+            if success:
+                with open(abs_output_path, 'wb') as f:
+                    f.write(buffer.tobytes())
+                print(f"✅ 已生成图片: {abs_output_path} ({os.path.getsize(abs_output_path)} bytes)")
+                return frame
+            else:
+                print(f"❌ 编码图片失败: {abs_output_path}")
+                return None
+
+        except Exception as e:
+            print(f"❌ 抽帧异常 (timestamp={timestamp}): {type(e).__name__}: {e}")
+            return None
+
+    def _extract_frame_for_comparison(self, video_path: str, timestamp: float, output_path: str) -> Optional[np.ndarray]:
         abs_video_path = os.path.normpath(video_path)
         abs_output_path = os.path.normpath(output_path)
 
@@ -274,7 +310,6 @@ class VideoProcessor:
             if success:
                 with open(abs_output_path, 'wb') as f:
                     f.write(buffer.tobytes())
-                print(f"✅ 已生成图片: {abs_output_path} ({os.path.getsize(abs_output_path)} bytes)")
                 return gray
             else:
                 print(f"❌ 编码图片失败: {abs_output_path}")
@@ -317,10 +352,13 @@ class VideoProcessor:
         prev_gray = None
 
         for ts in candidate_timestamps:
-            temp_path = os.path.join(self.frame_dir, f"{safe_name}_temp_{int(ts)}.jpg")
-            gray = self._extract_frame_as_gray(abs_video_path, ts, temp_path)
+            temp_gray_path = os.path.join(self.frame_dir, f"{safe_name}_temp_gray_{int(ts)}.jpg")
+            temp_color_path = os.path.join(self.frame_dir, f"{safe_name}_temp_color_{int(ts)}.jpg")
 
-            if gray is None:
+            gray = self._extract_frame_for_comparison(abs_video_path, ts, temp_gray_path)
+            color_frame = self._extract_frame(abs_video_path, ts, temp_color_path)
+
+            if gray is None or color_frame is None:
                 continue
 
             if prev_gray is not None:
@@ -330,26 +368,35 @@ class VideoProcessor:
                     start_time, end_time = self._calculate_time_range(ts, duration)
                     final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_{int(ts)}.jpg")
                     try:
-                        if os.path.exists(temp_path):
-                            os.rename(temp_path, final_path)
+                        if os.path.exists(temp_color_path):
+                            os.rename(temp_color_path, final_path)
                             key_frames.append((final_path, ts, start_time, end_time))
                             print(f"🖼️ 关键帧: {ts}s -> {final_path} (差异度: {diff:.3f})")
                     except Exception as e:
                         print(f"❌ 移动文件失败: {e}")
+                    try:
+                        if os.path.exists(temp_gray_path):
+                            os.remove(temp_gray_path)
+                    except Exception:
+                        pass
                 else:
                     try:
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
+                        if os.path.exists(temp_gray_path):
+                            os.remove(temp_gray_path)
+                        if os.path.exists(temp_color_path):
+                            os.remove(temp_color_path)
                     except Exception:
                         pass
             else:
                 start_time, end_time = self._calculate_time_range(ts, duration)
                 final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_{int(ts)}.jpg")
                 try:
-                    if os.path.exists(temp_path):
-                        os.rename(temp_path, final_path)
+                    if os.path.exists(temp_color_path):
+                        os.rename(temp_color_path, final_path)
                         key_frames.append((final_path, ts, start_time, end_time))
                         print(f"🖼️ 首帧: {ts}s -> {final_path}")
+                    if os.path.exists(temp_gray_path):
+                        os.remove(temp_gray_path)
                 except Exception as e:
                     print(f"❌ 移动文件失败: {e}")
 
@@ -364,17 +411,22 @@ class VideoProcessor:
 
             fallback_ts = 0
             while fallback_ts < duration:
-                temp_path = os.path.join(self.frame_dir, f"{safe_name}_fallback_{int(fallback_ts)}.jpg")
-                gray = self._extract_frame_as_gray(abs_video_path, fallback_ts, temp_path)
+                temp_gray_path = os.path.join(self.frame_dir, f"{safe_name}_fallback_gray_{int(fallback_ts)}.jpg")
+                temp_color_path = os.path.join(self.frame_dir, f"{safe_name}_fallback_color_{int(fallback_ts)}.jpg")
 
-                if gray is not None:
+                gray = self._extract_frame_for_comparison(abs_video_path, fallback_ts, temp_gray_path)
+                color_frame = self._extract_frame(abs_video_path, fallback_ts, temp_color_path)
+
+                if gray is not None and color_frame is not None:
                     start_time, end_time = self._calculate_time_range(fallback_ts, duration)
                     final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_{int(fallback_ts)}.jpg")
                     try:
-                        if os.path.exists(temp_path):
-                            os.rename(temp_path, final_path)
+                        if os.path.exists(temp_color_path):
+                            os.rename(temp_color_path, final_path)
                             key_frames.append((final_path, fallback_ts, start_time, end_time))
                             print(f"🖼️ 保底帧: {fallback_ts}s -> {final_path}")
+                        if os.path.exists(temp_gray_path):
+                            os.remove(temp_gray_path)
                     except Exception:
                         pass
 
@@ -386,8 +438,8 @@ class VideoProcessor:
             last_ts = max(0, duration - 1)
             start_time, end_time = self._calculate_time_range(last_ts, duration)
             final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_last.jpg")
-            gray = self._extract_frame_as_gray(abs_video_path, last_ts, final_path)
-            if gray is not None:
+            color_frame = self._extract_frame(abs_video_path, last_ts, final_path)
+            if color_frame is not None:
                 key_frames.append((final_path, last_ts, start_time, end_time))
                 print(f"🖼️ 末尾帧: {last_ts}s -> {final_path}")
 
