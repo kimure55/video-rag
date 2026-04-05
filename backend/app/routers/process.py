@@ -1,14 +1,65 @@
 from fastapi import APIRouter, HTTPException
-from app.models.schemas import ProcessRequest, ProcessResponse
+from app.models.schemas import ProcessRequest, ProcessResponse, ProcessStatus
 from app.services.chroma_service import VideoProcessor, ChromaService
 import os
 from typing import List
+from datetime import datetime
 
 router = APIRouter()
+
+process_status = {
+    "is_processing": False,
+    "current_video": "",
+    "current_video_index": 0,
+    "total_videos": 0,
+    "current_frame_index": 0,
+    "total_frames": 0,
+    "processed_videos": 0,
+    "processed_frames": 0,
+    "status": "idle",
+    "message": "",
+    "start_time": None,
+    "error": None
+}
+
+
+def reset_status():
+    global process_status
+    process_status = {
+        "is_processing": False,
+        "current_video": "",
+        "current_video_index": 0,
+        "total_videos": 0,
+        "current_frame_index": 0,
+        "total_frames": 0,
+        "processed_videos": 0,
+        "processed_frames": 0,
+        "status": "idle",
+        "message": "",
+        "start_time": None,
+        "error": None
+    }
+
+
+def update_status(**kwargs):
+    global process_status
+    for key, value in kwargs.items():
+        if key in process_status:
+            process_status[key] = value
+
+
+@router.get("/status")
+async def get_status():
+    return process_status
 
 
 @router.post("/", response_model=ProcessResponse)
 async def process_videos(request: ProcessRequest):
+    global process_status
+
+    if process_status["is_processing"]:
+        raise HTTPException(status_code=409, detail="Processing already in progress")
+
     if not os.path.exists(request.folder_path):
         raise HTTPException(status_code=400, detail="Folder path does not exist")
 
@@ -25,43 +76,71 @@ async def process_videos(request: ProcessRequest):
     if not video_files:
         raise HTTPException(status_code=400, detail="No video files found in the specified folder")
 
+    reset_status()
+    process_status["is_processing"] = True
+    process_status["total_videos"] = len(video_files)
+    process_status["status"] = "processing"
+    process_status["start_time"] = datetime.now().isoformat()
+
     processor = VideoProcessor()
     chroma_service = ChromaService()
 
     total_frames = 0
     processed_videos = 0
 
-    for video_path in video_files:
-        try:
-            results = processor.process_video(video_path)
+    try:
+        for idx, video_path in enumerate(video_files):
+            video_name = os.path.basename(video_path)
+            update_status(
+                current_video=video_name,
+                current_video_index=idx + 1,
+                current_frame_index=0
+            )
 
-            for result in results:
-                chroma_service.add_frame(
-                    frame_path=result["frame_path"],
-                    description=result["description"],
-                    video_path=result["video_path"],
-                    timestamp=result["timestamp"],
-                    start_time=result["start_time"],
-                    end_time=result["end_time"]
-                )
-                total_frames += 1
+            try:
+                results = processor.process_video(video_path)
 
-            processed_videos += 1
-        except Exception as e:
-            print(f"Error processing video {video_path}: {e}")
-            continue
+                for frame_idx, result in enumerate(results):
+                    chroma_service.add_frame(
+                        frame_path=result["frame_path"],
+                        description=result["description"],
+                        video_path=result["video_path"],
+                        timestamp=result["timestamp"],
+                        start_time=result["start_time"],
+                        end_time=result["end_time"]
+                    )
+                    total_frames += 1
+                    process_status["processed_frames"] = total_frames
+                    process_status["current_frame_index"] = frame_idx + 1
 
-    return ProcessResponse(
-        status="success",
-        message=f"Processed {processed_videos} videos with {total_frames} frames",
-        processed_videos=processed_videos,
-        total_frames=total_frames
-    )
+                processed_videos += 1
+                process_status["processed_videos"] = processed_videos
+
+            except Exception as e:
+                print(f"Error processing video {video_path}: {e}")
+                process_status["error"] = str(e)
+                continue
+
+        process_status["status"] = "completed"
+        process_status["message"] = f"Processed {processed_videos} videos with {total_frames} frames"
+        process_status["is_processing"] = False
+
+        return ProcessResponse(
+            status="success",
+            message=process_status["message"],
+            processed_videos=processed_videos,
+            total_frames=total_frames
+        )
+
+    except Exception as e:
+        process_status["status"] = "error"
+        process_status["error"] = str(e)
+        process_status["is_processing"] = False
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/frames")
 async def get_frames():
-    from app.services.chroma_service import ChromaService
     chroma_service = ChromaService()
     try:
         results = chroma_service.collection.get()

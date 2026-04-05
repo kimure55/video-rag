@@ -10,8 +10,35 @@ function App() {
   const [processing, setProcessing] = useState(false)
   const [folderPath, setFolderPath] = useState('')
   const [processStatus, setProcessStatus] = useState(null)
+  const [progressData, setProgressData] = useState(null)
   const [hoveredVideo, setHoveredVideo] = useState(null)
+  const [selectedImage, setSelectedImage] = useState(null)
   const videoRefs = useRef({})
+  const progressInterval = useRef(null)
+
+  useEffect(() => {
+    if (processing) {
+      progressInterval.current = setInterval(async () => {
+        try {
+          const resp = await axios.get(`${API_BASE}/process/status`)
+          setProgressData(resp.data)
+        } catch (e) {
+          console.error('获取进度失败', e)
+        }
+      }, 1000)
+    } else {
+      if (progressInterval.current) {
+        clearInterval(progressInterval.current)
+        progressInterval.current = null
+      }
+      setProgressData(null)
+    }
+    return () => {
+      if (progressInterval.current) {
+        clearInterval(progressInterval.current)
+      }
+    }
+  }, [processing])
 
   const handleSearch = async (e) => {
     if (e) e.preventDefault()
@@ -37,6 +64,16 @@ function App() {
 
     setProcessing(true)
     setProcessStatus(null)
+    setProgressData({
+      is_processing: true,
+      current_video: '',
+      current_video_index: 0,
+      total_videos: 0,
+      current_frame_index: 0,
+      processed_frames: 0,
+      status: 'processing'
+    })
+
     try {
       const response = await axios.post(`${API_BASE}/process/`, {
         folder_path: folderPath
@@ -53,6 +90,7 @@ function App() {
       })
     } finally {
       setProcessing(false)
+      setProgressData(null)
     }
   }
 
@@ -98,8 +136,49 @@ function App() {
     }
   }
 
+  const handleShowInFolder = (videoPath) => {
+    if (window.electronAPI) {
+      window.electronAPI.showItemInFolder(videoPath)
+    } else {
+      alert('仅支持 Electron 环境')
+    }
+  }
+
+  const getFrameUrl = (framePath) => {
+    const filename = framePath.split(/[\\/]/).pop()
+    return `${API_BASE}/frames/${filename}`
+  }
+
+  const getProgressPercent = () => {
+    if (!progressData || progressData.total_videos === 0) return 0
+    return Math.round((progressData.current_video_index / progressData.total_videos) * 100)
+  }
+
   return (
     <div className="min-h-screen bg-premiere-dark flex flex-col">
+      {selectedImage && (
+        <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-8" onClick={() => setSelectedImage(null)}>
+          <div className="relative max-w-6xl max-h-full" onClick={(e) => e.stopPropagation()}>
+            <button
+              onClick={() => setSelectedImage(null)}
+              className="absolute -top-10 right-0 text-white text-2xl hover:text-gray-300"
+            >
+              ✕ 关闭
+            </button>
+            <img
+              src={selectedImage.url}
+              alt={selectedImage.description}
+              className="max-w-full max-h-[80vh] object-contain rounded-lg"
+            />
+            <div className="mt-4 text-white text-center">
+              <p className="text-lg">{selectedImage.description}</p>
+              <p className="text-gray-400 text-sm mt-1">{selectedImage.video}</p>
+              <p className="text-premiere-accent text-sm">{formatTimeRange(selectedImage.start_time, selectedImage.end_time)}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
       <header className="border-b border-premiere-light bg-premiere-gray">
         <div className="max-w-7xl mx-auto px-6 py-4">
           <div className="flex items-center justify-between mb-4">
@@ -159,20 +238,33 @@ function App() {
                 disabled={processing || !folderPath.trim()}
                 className="px-5 py-2 bg-green-600 text-white rounded-md font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm whitespace-nowrap"
               >
-                {processing ? (
-                  <span className="flex items-center gap-2">
-                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                    处理中...
-                  </span>
-                ) : (
-                  '处理视频'
-                )}
+                {processing ? '处理中...' : '处理视频'}
               </button>
             </div>
           </div>
+
+          {processing && progressData && (
+            <div className="mt-4 bg-premiere-dark rounded-lg p-4 border border-premiere-light">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm text-white">
+                  正在处理：{progressData.current_video || '初始化中...'}
+                  {progressData.total_videos > 0 && ` (${progressData.current_video_index}/${progressData.total_videos})`}
+                </span>
+                <span className="text-sm text-premiere-accent">{getProgressPercent()}%</span>
+              </div>
+              <div className="w-full bg-premiere-gray rounded-full h-2 overflow-hidden">
+                <div
+                  className="bg-premiere-accent h-full transition-all duration-300"
+                  style={{ width: `${getProgressPercent()}%` }}
+                />
+              </div>
+              {progressData.processed_frames > 0 && (
+                <p className="text-xs text-gray-400 mt-2">
+                  已处理 {progressData.processed_frames} 帧
+                </p>
+              )}
+            </div>
+          )}
 
           {processStatus && (
             <div className={`mt-3 px-4 py-3 rounded-md text-sm ${processStatus.status === 'success' ? 'bg-green-900/50 text-green-400 border border-green-700' : 'bg-red-900/50 text-red-400 border border-red-700'}`}>
@@ -203,7 +295,7 @@ function App() {
                 <div
                   key={`${result.video_path}-${result.timestamp}-${index}`}
                   className="video-card aspect-video"
-                  onMouseEnter={() => handleMouseEnter(result.video_path)}
+                  onMouseEnter={() => handleMouseEnter(result)}
                   onMouseLeave={handleMouseLeave}
                 >
                   {hoveredVideo === result.video_path ? (
@@ -224,11 +316,18 @@ function App() {
                     />
                   ) : (
                     <img
-                      src={`file://${result.frame_path}`}
+                      src={getFrameUrl(result.frame_path)}
                       alt={result.description}
-                      className="thumbnail"
+                      className="thumbnail cursor-pointer"
+                      onClick={() => setSelectedImage({
+                        url: getFrameUrl(result.frame_path),
+                        description: result.description,
+                        video: result.video_path.split(/[\\/]/).pop(),
+                        start_time: result.start_time,
+                        end_time: result.end_time
+                      })}
                       onError={(e) => {
-                        e.target.style.display = 'none'
+                        e.target.src = `file://${result.frame_path}`
                       }}
                     />
                   )}
@@ -244,9 +343,21 @@ function App() {
                     <p className="text-xs text-gray-300 line-clamp-2">
                       {result.description}
                     </p>
-                    <p className="text-xs text-gray-500 mt-1 truncate">
-                      {result.video_path.split(/[\\/]/).pop()}
-                    </p>
+                    <div className="flex items-center justify-between mt-2">
+                      <p className="text-xs text-gray-500 truncate flex-1">
+                        {result.video_path.split(/[\\/]/).pop()}
+                      </p>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleShowInFolder(result.video_path)
+                        }}
+                        className="text-xs text-premiere-accent hover:text-cyan-400 ml-2"
+                        title="在文件夹中显示"
+                      >
+                        📂
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}

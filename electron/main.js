@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -112,4 +112,8 @@ ipcMain.handle('select-folder', async () => {
 
 ipcMain.handle('get-app-path', () => {
   return app.getPath('userData');
+});
+
+ipcMain.handle('show-item-in-folder', async (event, filePath) => {
+  shell.showItemInFolder(filePath);
 });

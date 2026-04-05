@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import os
 
@@ -8,6 +9,8 @@ from app.services.chroma_service import ChromaService
 
 
 chroma_service = None
+
+frames_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frames")
 
 
 def get_chroma_service() -> ChromaService:
@@ -19,6 +22,7 @@ def get_chroma_service() -> ChromaService:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    os.makedirs(frames_dir, exist_ok=True)
     yield
 
 
@@ -35,6 +39,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.mount("/frames", StaticFiles(directory=frames_dir), name="frames")
 
 app.include_router(process.router, prefix="/process", tags=["process"])
 app.include_router(search.router, prefix="/search", tags=["search"])

@@ -13,6 +13,21 @@ class ProcessResponse(BaseModel):
     total_frames: int
 
 
+class ProcessStatus(BaseModel):
+    is_processing: bool
+    current_video: str
+    current_video_index: int
+    total_videos: int
+    current_frame_index: int
+    total_frames: int
+    processed_videos: int
+    processed_frames: int
+    status: str
+    message: str
+    start_time: Optional[str] = None
+    error: Optional[str] = None
+
+
 class SearchRequest(BaseModel):
     query: str
     top_k: Optional[int] = 10

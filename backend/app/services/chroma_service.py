@@ -1,77 +1,140 @@
 import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import cv2
+import base64
+import requests
 import numpy as np
 import uuid
-import httpx
-import base64
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from PIL import Image
-from io import BytesIO
 from typing import List, Optional, Tuple
-import numpy as np
 
 
 class ChromaService:
     def __init__(self, persist_directory: str = "./chroma_db"):
         self.persist_directory = persist_directory
         self.collection_name = "video_frames"
+        self.model_ready = False
         self._init_chroma()
+        self._init_embedding_model()
+
+    def _init_embedding_model(self):
+        try:
+            from sentence_transformers import SentenceTransformer
+            print("⏳ 正在加载 moka-ai/m3e-base 嵌入模型（CPU）...")
+            self.encoder = SentenceTransformer('moka-ai/m3e-base', device='cpu')
+            self.model_ready = True
+            print("✅ moka-ai/m3e-base 嵌入模型加载成功！")
+        except Exception as e:
+            print(f"❌ 嵌入模型加载失败: {e}")
+            print("💡 请手动下载模型：https://huggingface.co/moka-ai/m3e-base")
+            self.model_ready = False
 
     def _init_chroma(self):
-        self.chroma_client = chromadb.PersistentClient(
-            path=self.persist_directory,
-            settings=Settings(anonymized_telemetry=False)
-        )
-        self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
-
         try:
-            self.collection = self.chroma_client.get_collection(name=self.collection_name)
-            self.collection.delete(where={})
-        except Exception:
-            pass
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"description": "Video frame descriptions for semantic search"}
-        )
+            self.chroma_client = chromadb.PersistentClient(
+                path=self.persist_directory,
+                settings=Settings(anonymized_telemetry=False)
+            )
+
+            expected_dim = 768
+
+            try:
+                self.collection = self.chroma_client.get_collection(name=self.collection_name)
+                existing_dim = self.collection.metadata.get("embedding_dimension", 0)
+
+                if existing_dim != expected_dim:
+                    print(f"⚠️ 数据库维度不匹配（现有: {existing_dim}, 需要: {expected_dim}），正在删除旧数据库...")
+                    self.chroma_client.delete_collection(name=self.collection_name)
+                    self.collection = self.chroma_client.get_or_create_collection(
+                        name=self.collection_name,
+                        metadata={
+                            "description": "Video frame descriptions for semantic search",
+                            "embedding_dimension": expected_dim
+                        }
+                    )
+                    print("✅ 新数据库已创建（768维度）")
+                else:
+                    print(f"✅ 数据库维度匹配: {existing_dim}")
+
+            except Exception:
+                self.collection = self.chroma_client.get_or_create_collection(
+                    name=self.collection_name,
+                    metadata={
+                        "description": "Video frame descriptions for semantic search",
+                        "embedding_dimension": expected_dim
+                    }
+                )
+                print("✅ 新数据库已创建（768维度）")
+
+        except Exception as e:
+            print(f"❌ ChromaDB 初始化失败: {e}")
+            raise
 
     def add_frame(self, frame_path: str, description: str, video_path: str,
                   timestamp: float, start_time: float, end_time: float):
+        if not self.model_ready:
+            print("⚠️ 嵌入模型未就绪，跳过添加")
+            return
+
         doc_id = str(uuid.uuid4())
 
-        self.collection.add(
-            documents=[description],
-            metadatas=[{
-                "frame_path": frame_path,
-                "video_path": video_path,
-                "timestamp": timestamp,
-                "start_time": start_time,
-                "end_time": end_time,
-                "description": description
-            }],
-            ids=[doc_id]
-        )
+        try:
+            embedding = self.encoder.encode(description).tolist()
+
+            self.collection.add(
+                embeddings=[embedding],
+                documents=[description],
+                metadatas=[{
+                    "frame_path": frame_path,
+                    "video_path": video_path,
+                    "timestamp": timestamp,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "description": description
+                }],
+                ids=[doc_id]
+            )
+        except Exception as e:
+            print(f"❌ 添加帧数据失败: {e}")
 
     def search(self, query: str, top_k: int = 10) -> List[dict]:
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=top_k
-        )
+        if not query or not query.strip():
+            return []
 
-        search_results = []
-        if results["ids"] and len(results["ids"]) > 0:
-            for i in range(len(results["ids"][0])):
-                search_results.append({
-                    "video_path": results["metadatas"][0][i]["video_path"],
-                    "frame_path": results["metadatas"][0][i]["frame_path"],
-                    "description": results["metadatas"][0][i]["description"],
-                    "timestamp": results["metadatas"][0][i]["timestamp"],
-                    "start_time": results["metadatas"][0][i]["start_time"],
-                    "end_time": results["metadatas"][0][i]["end_time"],
-                    "score": float(results["distances"][0][i]) if "distances" in results else 0.0
-                })
+        if not self.model_ready:
+            print("⚠️ 嵌入模型未就绪，无法执行搜索")
+            return []
 
-        return search_results
+        try:
+            query_embedding = self.encoder.encode(query.strip()).tolist()
+
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k
+            )
+
+            search_results = []
+            if results and results["ids"] and len(results["ids"]) > 0:
+                for i in range(len(results["ids"][0])):
+                    search_results.append({
+                        "video_path": results["metadatas"][0][i].get("video_path", ""),
+                        "frame_path": results["metadatas"][0][i].get("frame_path", ""),
+                        "description": results["metadatas"][0][i].get("description", ""),
+                        "timestamp": results["metadatas"][0][i].get("timestamp", 0.0),
+                        "start_time": results["metadatas"][0][i].get("start_time", 0.0),
+                        "end_time": results["metadatas"][0][i].get("end_time", 0.0),
+                        "score": float(results["distances"][0][i]) if results.get("distances") else 0.0
+                    })
+
+            return search_results
+
+        except Exception as e:
+            print(f"❌ 搜索失败: {e}")
+            return []
 
     def clear(self):
         try:
@@ -87,81 +150,61 @@ class OllamaService:
         self.max_dim = 768
         self.jpeg_quality = 70
 
-    def _resize_and_compress_image(self, frame):
-        """
-        终极万能图像瘦身：防 502 报错，且兼容路径、Base64 和 OpenCV 图像实体
-        """
-        if not frame:
+    def _resize_and_compress_image(self, frame_data):
+        if not frame_data:
             return ""
 
         img = None
 
-        # 1. 智能侦测：看看传进来的 frame 到底是什么物种
-        if isinstance(frame, str):
-            # 情况 A：它传了一个文件路径过来
-            if os.path.exists(frame):
-                img = cv2.imread(frame)
+        if isinstance(frame_data, str):
+            abs_path = os.path.abspath(frame_data)
+            if os.path.exists(abs_path):
+                img = cv2.imread(abs_path)
             else:
-                # 情况 B：它传了一串已经转好的 Base64 文本过来
-                try:
-                    img_data = base64.b64decode(frame)
-                    nparr = np.frombuffer(img_data, np.uint8)
-                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                except Exception:
-                    print("❌ 传入的字符串既不是文件路径，也不是有效的 Base64！")
-                    return ""
-        elif hasattr(frame, 'shape'):
-            # 情况 C：非常标准，传的就是 OpenCV 图像实体
-            img = frame
+                print(f"❌ 找不到图片文件: {abs_path}")
+                return ""
+        elif hasattr(frame_data, 'shape'):
+            img = frame_data
         else:
-            print("❌ 未知格式的视频帧数据")
+            print("❌ 传入的数据既不是路径也不是图像！")
             return ""
 
-        # 防御性判断，如果都没解析出来图片，直接放弃
         if img is None:
             return ""
 
-        # 2. 限制物理分辨率：最大边长 768 像素 (Ollama 甜点区)
         height, width = img.shape[:2]
         max_size = 768
-        
+
         if width > max_size or height > max_size:
             scale = max_size / max(width, height)
             img = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-        # 3. 限制体积：JPEG 高压缩
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
         success, buffer = cv2.imencode('.jpg', img, encode_param)
-        
+
         if not success:
-            print("❌ OpenCV 压缩图片失败！")
+            print("❌ 图片压缩失败！")
             return ""
-            
-        # 4. 干净的 Base64 转码
+
         return base64.b64encode(buffer).decode('utf-8')
 
     def describe_frame(self, frame):
-        """
-        调用 Ollama 生成画面描述，带显存硬控
-        """
         base64_str = self._resize_and_compress_image(frame)
         if not base64_str:
             return "无效画面"
 
         payload = {
             "model": "llava",
-            "prompt": "作为专业视频导演，用中文简短描述画面的内容、光影和氛围，20字以内。",
+            "prompt": "作为专业视频导演，用中文简短描述画面的内容，光影和氛围，20字以内。",
             "images": [base64_str],
             "stream": False,
             "options": {
-                "num_ctx": 2048,      # 锁死显存，防止大图撑爆
-                "temperature": 0.2    # 降低 AI 幻觉
+                "num_ctx": 2048,
+                "temperature": 0.2
             }
         }
 
         try:
-            import requests
-            # 发送给本地的 Ollama
             response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=30)
             if response.status_code == 200:
                 return response.json().get("response", "").strip()
@@ -172,43 +215,73 @@ class OllamaService:
             print(f"❌ 无法连接到 Ollama: {e}")
             return "连接超时"
 
+
 class VideoProcessor:
     def __init__(self):
         self.ollama_service = OllamaService()
         self.frame_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frames")
         os.makedirs(self.frame_dir, exist_ok=True)
-        self.ffmpeg_path = r"C:\ffmpeg\bin\ffmpeg.exe"
-        self.ffprobe_path = r"C:\ffmpeg\bin\ffprobe.exe"
         self.diff_threshold = 0.20
         self.time_window = 5.0
 
     def _get_video_duration(self, video_path: str) -> float:
-        import subprocess
+        abs_path = os.path.normpath(video_path)
+        print(f"📹 读取视频路径: {abs_path}")
+
         try:
-            result = subprocess.run(
-                [self.ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-                capture_output=True,
-                timeout=30
-            )
-            duration_str = result.stdout.decode('utf-8', errors='ignore').strip()
-            return float(duration_str) if duration_str else 60
-        except Exception:
+            cap = cv2.VideoCapture(abs_path)
+            if not cap.isOpened():
+                print(f"❌ OpenCV 无法打开视频: {abs_path}")
+                return 60
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = frame_count / fps if fps > 0 else 60
+            cap.release()
+
+            print(f"⏱️ 视频时长: {duration} 秒 (FPS: {fps}, 帧数: {frame_count})")
+            return duration
+
+        except Exception as e:
+            print(f"❌ 获取视频时长失败: {e}")
             return 60
 
     def _extract_frame_as_gray(self, video_path: str, timestamp: float, output_path: str) -> Optional[np.ndarray]:
-        import subprocess
-        try:
-            subprocess.run([
-                self.ffmpeg_path, "-ss", str(timestamp), "-i", video_path,
-                "-vframes", "1", "-vf", "rgb2gray", "-y", output_path
-            ], capture_output=True, timeout=15)
+        abs_video_path = os.path.normpath(video_path)
+        abs_output_path = os.path.normpath(output_path)
 
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                img = Image.open(output_path)
-                return np.array(img)
-            return None
+        os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
+
+        try:
+            cap = cv2.VideoCapture(abs_video_path)
+            if not cap.isOpened():
+                print(f"❌ OpenCV 无法打开视频: {abs_video_path}")
+                return None
+
+            cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret or frame is None:
+                print(f"❌ 无法读取帧 (timestamp={timestamp})")
+                return None
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+            success, buffer = cv2.imencode('.jpg', gray, encode_param)
+
+            if success:
+                with open(abs_output_path, 'wb') as f:
+                    f.write(buffer.tobytes())
+                print(f"✅ 已生成图片: {abs_output_path} ({os.path.getsize(abs_output_path)} bytes)")
+                return gray
+            else:
+                print(f"❌ 编码图片失败: {abs_output_path}")
+                return None
+
         except Exception as e:
-            print(f"Error extracting frame at {timestamp}s: {e}")
+            print(f"❌ 抽帧异常 (timestamp={timestamp}): {type(e).__name__}: {e}")
             return None
 
     def _calculate_histogram_diff(self, gray1: np.ndarray, gray2: np.ndarray) -> float:
@@ -227,11 +300,13 @@ class VideoProcessor:
         return start_time, end_time
 
     def extract_frames(self, video_path: str) -> List[Tuple[str, float, float, float]]:
-        import subprocess
+        abs_video_path = os.path.normpath(video_path)
+        print(f"🎬 开始处理视频: {abs_video_path}")
 
-        duration = self._get_video_duration(video_path)
-        safe_name = "".join(c if c.isalnum() else "_" for c in os.path.basename(video_path))
+        duration = self._get_video_duration(abs_video_path)
+        safe_name = "".join(c if c.isalnum() else "_" for c in os.path.basename(abs_video_path))
 
+        print(f"🔍 策略1: 场景切换检测 (阈值: {self.diff_threshold})")
         candidate_timestamps = []
         second = 0
         while second < duration:
@@ -240,11 +315,10 @@ class VideoProcessor:
 
         key_frames = []
         prev_gray = None
-        prev_timestamp = None
 
         for ts in candidate_timestamps:
             temp_path = os.path.join(self.frame_dir, f"{safe_name}_temp_{int(ts)}.jpg")
-            gray = self._extract_frame_as_gray(video_path, ts, temp_path)
+            gray = self._extract_frame_as_gray(abs_video_path, ts, temp_path)
 
             if gray is None:
                 continue
@@ -256,40 +330,73 @@ class VideoProcessor:
                     start_time, end_time = self._calculate_time_range(ts, duration)
                     final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_{int(ts)}.jpg")
                     try:
-                        os.rename(temp_path, final_path)
-                        key_frames.append((final_path, ts, start_time, end_time))
-                    except Exception:
-                        pass
+                        if os.path.exists(temp_path):
+                            os.rename(temp_path, final_path)
+                            key_frames.append((final_path, ts, start_time, end_time))
+                            print(f"🖼️ 关键帧: {ts}s -> {final_path} (差异度: {diff:.3f})")
+                    except Exception as e:
+                        print(f"❌ 移动文件失败: {e}")
                 else:
                     try:
-                        os.remove(temp_path)
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
                     except Exception:
                         pass
             else:
                 start_time, end_time = self._calculate_time_range(ts, duration)
                 final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_{int(ts)}.jpg")
                 try:
-                    os.rename(temp_path, final_path)
-                    key_frames.append((final_path, ts, start_time, end_time))
-                except Exception:
-                    pass
+                    if os.path.exists(temp_path):
+                        os.rename(temp_path, final_path)
+                        key_frames.append((final_path, ts, start_time, end_time))
+                        print(f"🖼️ 首帧: {ts}s -> {final_path}")
+                except Exception as e:
+                    print(f"❌ 移动文件失败: {e}")
 
             prev_gray = gray
-            prev_timestamp = ts
+
+        print(f"📊 场景检测结果: {len(key_frames)} 个关键帧")
+
+        if len(key_frames) < 2:
+            print(f"🔄 关键帧太少，启用保底策略: 每5秒抽一帧")
+            key_frames = []
+            prev_gray = None
+
+            fallback_ts = 0
+            while fallback_ts < duration:
+                temp_path = os.path.join(self.frame_dir, f"{safe_name}_fallback_{int(fallback_ts)}.jpg")
+                gray = self._extract_frame_as_gray(abs_video_path, fallback_ts, temp_path)
+
+                if gray is not None:
+                    start_time, end_time = self._calculate_time_range(fallback_ts, duration)
+                    final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_{int(fallback_ts)}.jpg")
+                    try:
+                        if os.path.exists(temp_path):
+                            os.rename(temp_path, final_path)
+                            key_frames.append((final_path, fallback_ts, start_time, end_time))
+                            print(f"🖼️ 保底帧: {fallback_ts}s -> {final_path}")
+                    except Exception:
+                        pass
+
+                fallback_ts += 5
+
+            print(f"📊 保底策略结果: {len(key_frames)} 个帧")
 
         if not key_frames:
             last_ts = max(0, duration - 1)
             start_time, end_time = self._calculate_time_range(last_ts, duration)
-            final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_{int(last_ts)}.jpg")
-            gray = self._extract_frame_as_gray(video_path, last_ts, final_path)
+            final_path = os.path.join(self.frame_dir, f"{safe_name}_frame_last.jpg")
+            gray = self._extract_frame_as_gray(abs_video_path, last_ts, final_path)
             if gray is not None:
                 key_frames.append((final_path, last_ts, start_time, end_time))
+                print(f"🖼️ 末尾帧: {last_ts}s -> {final_path}")
 
         return key_frames
 
     def process_video(self, video_path: str) -> List[dict]:
-        duration = self._get_video_duration(video_path)
-        frames = self.extract_frames(video_path)
+        abs_video_path = os.path.normpath(video_path)
+        duration = self._get_video_duration(abs_video_path)
+        frames = self.extract_frames(abs_video_path)
         print(f"Detected {len(frames)} key frames")
         results = []
 
@@ -299,7 +406,7 @@ class VideoProcessor:
             if description:
                 results.append({
                     "frame_path": frame_path,
-                    "video_path": video_path,
+                    "video_path": abs_video_path,
                     "timestamp": timestamp,
                     "start_time": start_time,
                     "end_time": end_time,
