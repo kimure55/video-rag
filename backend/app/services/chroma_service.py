@@ -27,7 +27,22 @@ class ChromaService:
         self._lock = threading.Lock()
         self._init_chroma()
         self._init_embedding_model()
+        self._init_clip_model()
         self._load_processed_videos()
+
+    def _init_clip_model(self):
+        try:
+            print("[DEBUG] 开始初始化CLIP模型...")
+            from app.services.clip_service import get_clip_service
+            print("[DEBUG] 导入get_clip_service成功")
+            print("[WAIT] 正在加载 CLIP 模型...")
+            self.clip = get_clip_service()
+            print("[OK] CLIP模型加载成功！")
+        except Exception as e:
+            print(f"[ERROR] CLIP模型加载失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.clip = None
 
     def _init_embedding_model(self):
         try:
@@ -48,7 +63,7 @@ class ChromaService:
                 settings=Settings(anonymized_telemetry=False)
             )
 
-            expected_dim = 768
+            expected_dim = 512
 
             try:
                 self.collection = self.chroma_client.get_collection(name=self.collection_name)
@@ -73,8 +88,8 @@ class ChromaService:
         collection = self.chroma_client.get_or_create_collection(
             name=self.collection_name,
             metadata={
-                "description": "Video frame descriptions for semantic search",
-                "embedding_dimension": 768,
+                "description": "Video frame CLIP embeddings for semantic search",
+                "embedding_dimension": 512,
                 "hnsw:space": "cosine"
             }
         )
@@ -168,12 +183,17 @@ class ChromaService:
         successful = 0
         embedding_lock = threading.Lock()
 
-        def encode_frame(desc):
-            return self.encoder.encode(desc).tolist()
+        def get_clip_embedding(frame):
+            clip_emb = frame.get("clip_embedding")
+            if clip_emb:
+                return clip_emb
+            if self.clip and os.path.exists(frame.get("frame_path", "")):
+                return self.clip.encode_image(frame["frame_path"])
+            return self.encoder.encode(frame["description"]).tolist()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_frame = {
-                executor.submit(encode_frame, frame["description"]): frame
+                executor.submit(get_clip_embedding, frame): frame
                 for frame in frames
             }
 
@@ -184,7 +204,7 @@ class ChromaService:
                     embedding = future.result()
                     embeddings_list.append(embedding)
                 except Exception as e:
-                    print(f"[WARN] Embedding失败: {e}")
+                    print(f"[WARN] CLIP Embedding失败: {e}")
                     embeddings_list.append(None)
 
         embeddings_to_add = []
@@ -242,7 +262,12 @@ class ChromaService:
             return []
 
         try:
-            query_embedding = self.encoder.encode(query.strip()).tolist()
+            from app.services.clip_service import get_clip_service
+            clip = get_clip_service()
+
+            query_embedding = clip.encode_text(query.strip())
+            if query_embedding is None:
+                query_embedding = self.encoder.encode(query.strip()).tolist()
 
             results = self.collection.query(
                 query_embeddings=[query_embedding],
@@ -364,6 +389,17 @@ class OllamaService:
         self._ollama_lock = threading.Lock()
         self._ollama_concurrent = 0
         self._ollama_max_concurrent = 2
+        self.clip = None
+
+    def init_clip(self):
+        try:
+            from app.services.clip_service import get_clip_service
+            print("[WAIT] Ollama服务初始化CLIP...")
+            self.clip = get_clip_service()
+            print("[OK] Ollama服务CLIP初始化成功！")
+        except Exception as e:
+            print(f"[ERROR] Ollama服务CLIP初始化失败: {e}")
+            self.clip = None
 
     def _get_process_pool(self):
         if self._process_pool is None:
@@ -415,7 +451,9 @@ class OllamaService:
                 )
                 if response.status_code == 200:
                     result = response.json().get("response", "").strip()
-                    return self._parse_description_result(result)
+                    desc_dict = self._parse_description_result(result)
+                    desc_dict["clip_embedding"] = self._encode_clip_image(frame_path)
+                    return desc_dict
                 else:
                     print(f"[WARN] Ollama 响应错误: {response.status_code}")
             except requests.exceptions.Timeout:
@@ -426,7 +464,18 @@ class OllamaService:
                 with self._ollama_lock:
                     self._ollama_concurrent = max(0, self._ollama_concurrent - 1)
 
-        return self._empty_description()
+        desc = self._empty_description()
+        desc["clip_embedding"] = self._encode_clip_image(frame_path)
+        return desc
+
+    def _encode_clip_image(self, frame_path: str) -> Optional[list]:
+        if self.clip is None:
+            return None
+        try:
+            return self.clip.encode_image(frame_path)
+        except Exception as e:
+            print(f"[WARN] CLIP编码失败: {e}")
+            return None
 
     def _empty_description(self) -> dict:
         return {
@@ -545,6 +594,7 @@ class OllamaService:
 class VideoProcessor:
     def __init__(self):
         self.ollama_service = OllamaService()
+        self.ollama_service.init_clip()
         self.frame_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frames")
         os.makedirs(self.frame_dir, exist_ok=True)
         self.diff_threshold = 0.15
