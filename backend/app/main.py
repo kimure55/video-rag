@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
+from pathlib import Path
 import os
 
 from app.routers import process, search
@@ -9,7 +10,7 @@ from app.services.singleton import init_chroma_service
 from app.services.websocket_manager import ws_manager
 
 
-frames_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frames")
+frames_dir = str(Path(__file__).parent.parent / "frames")
 
 
 @asynccontextmanager
@@ -41,7 +42,12 @@ app.include_router(search.router, prefix="/search", tags=["search"])
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "Video RAG API"}
+    abs_frames_path = str(Path(frames_dir).resolve())
+    return {
+        "status": "healthy",
+        "service": "Video RAG API",
+        "frames_dir": abs_frames_path
+    }
 
 
 @app.websocket("/ws/progress")

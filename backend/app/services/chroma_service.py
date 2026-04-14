@@ -7,6 +7,8 @@ import requests
 import numpy as np
 import uuid
 import hashlib
+import time
+import threading
 import chromadb
 from chromadb.config import Settings
 from PIL import Image
@@ -250,10 +252,10 @@ class ChromaService:
             search_results = []
             if results and results["ids"] and len(results["ids"]) > 0:
                 for i in range(len(results["ids"][0])):
-                    distance = float(results["distances"][0][i]) if results.get("distances") else 1.0
-                    similarity = max(0.0, (1.0 - distance / 2.0) * 100.0)
+                    distance = float(results["distances"][0][i]) if results.get("distances") else 2.0
+                    match_score = round(max(0.0, (1.0 - distance / 2.0) * 100.0), 1)
 
-                    if similarity >= min_score:
+                    if match_score >= min_score:
                         search_results.append({
                             "video_path": results["metadatas"][0][i].get("video_path", ""),
                             "frame_path": results["metadatas"][0][i].get("frame_path", ""),
@@ -262,7 +264,7 @@ class ChromaService:
                             "start_time": results["metadatas"][0][i].get("start_time", 0.0),
                             "end_time": results["metadatas"][0][i].get("end_time", 0.0),
                             "distance": distance,
-                            "score": similarity,
+                            "match_score": match_score,
                             "shot_size": results["metadatas"][0][i].get("shot_size", ""),
                             "camera_movement": results["metadatas"][0][i].get("camera_movement", ""),
                             "lighting": results["metadatas"][0][i].get("lighting", ""),
@@ -358,6 +360,9 @@ class OllamaService:
         self._process_pool = None
         self._thread_pool = None
         self.max_workers = min(4, max(1, cpu_count() - 1))
+        self._ollama_lock = threading.Lock()
+        self._ollama_concurrent = 0
+        self._ollama_max_concurrent = 2
 
     def _get_process_pool(self):
         if self._process_pool is None:
@@ -374,7 +379,7 @@ class OllamaService:
         if not base64_str:
             return self._empty_description()
 
-        prompt = """你是一位专业场记。请用一段连贯的中文描述该画面，严禁输出"1.景别、2.光影"这种编号模版。必须描述：主体的具体动作、环境的影调氛围（如：冷调、高反差）、以及镜头的动态感受。如果画面包含文字，请记录下来。"""
+        prompt = """你是一位专业影视摄影师。请用一段自然的行业术语描述这个画面，切记不要使用"1.景别 2.光影"这种死板编号格式。必须包含：主体的动作表情、画面的影调氛围（冷/暖/高反差等）、以及镜头传达的情绪。如果画面有文字请记录。"""
 
         payload = {
             "model": self.model,
@@ -390,6 +395,10 @@ class OllamaService:
 
         max_retries = 3
         for attempt in range(max_retries):
+            with self._ollama_lock:
+                while self._ollama_concurrent >= self._ollama_max_concurrent:
+                    time.sleep(0.5)
+                self._ollama_concurrent += 1
             try:
                 response = requests.post(
                     f"{self.base_url}/api/generate",
@@ -405,6 +414,9 @@ class OllamaService:
                 print(f"[WAIT] Ollama 超时 (尝试 {attempt + 1}/{max_retries})")
             except Exception as e:
                 print(f"[ERROR] Ollama 请求失败: {e}")
+            finally:
+                with self._ollama_lock:
+                    self._ollama_concurrent = max(0, self._ollama_concurrent - 1)
 
         return self._empty_description()
 
@@ -540,15 +552,14 @@ class VideoProcessor:
         return f"video_{hash_str}"
 
     def _get_video_info(self, video_path: str) -> dict:
-        abs_path = self._normalize_path(video_path)
-        abs_path_safe = abs_path.encode('utf-8', errors='ignore').decode('utf-8')
+        abs_path = os.path.normpath(os.path.abspath(video_path))
 
         try:
-            cap = cv2.VideoCapture(abs_path_safe)
+            cap = cv2.VideoCapture(abs_path)
             if not cap.isOpened():
                 try:
                     cap.release()
-                    cap = cv2.VideoCapture(abs_path.encode('gbk', errors='ignore').decode('gbk'))
+                    cap = cv2.VideoCapture(abs_path)
                 except:
                     pass
 
@@ -577,8 +588,8 @@ class VideoProcessor:
             return {"duration": 60, "fps": 30, "width": 1920, "height": 1080, "frame_count": 1800, "resolution": "1920x1080"}
 
     def _extract_frame_safe(self, video_path: str, timestamp: float, output_path: str) -> Optional[np.ndarray]:
-        abs_video_path = self._normalize_path(video_path)
-        abs_output_path = self._normalize_path(output_path)
+        abs_video_path = os.path.normpath(os.path.abspath(video_path))
+        abs_output_path = os.path.normpath(os.path.abspath(output_path))
 
         os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
 
@@ -587,7 +598,7 @@ class VideoProcessor:
             if not cap.isOpened():
                 try:
                     cap.release()
-                    cap = cv2.VideoCapture(abs_video_path.encode('gbk', errors='ignore').decode('gbk'))
+                    cap = cv2.VideoCapture(abs_video_path)
                 except:
                     pass
 
@@ -606,8 +617,7 @@ class VideoProcessor:
             success, buffer = cv2.imencode('.jpg', frame, encode_param)
 
             if success:
-                with open(abs_output_path, 'wb') as f:
-                    f.write(buffer.tobytes())
+                buffer.tofile(abs_output_path)
                 return frame
             return None
 
@@ -641,13 +651,14 @@ class VideoProcessor:
         return start_time, end_time
 
     def extract_keyframes(self, video_path: str, force: bool = False) -> List[Tuple[str, float, float, float, dict]]:
-        abs_video_path = self._normalize_path(video_path)
+        abs_video_path = os.path.normpath(os.path.abspath(video_path))
         safe_name = self._safe_filename(video_path)
         video_info = self._get_video_info(abs_video_path)
         duration = video_info["duration"]
+        cpu_cores = min(4, max(1, cpu_count() - 1))
 
         print(f"[VIDEO] 处理视频: {abs_video_path}")
-        print(f"   分辨率: {video_info['resolution']}, 时长: {duration:.1f}s")
+        print(f"   分辨率: {video_info['resolution']}, 时长: {duration:.1f}s, CPU核心: {cpu_cores}")
 
         frame_pattern = os.path.join(self.frame_dir, f"{safe_name}_kf_*.jpg")
         existing_frames = sorted([
@@ -668,16 +679,30 @@ class VideoProcessor:
                     continue
             return keyframes
 
+        timestamps_to_extract = []
+        t = 0.0
+        while t < duration and len(timestamps_to_extract) < self.max_frames_per_video:
+            timestamps_to_extract.append(t)
+            t += self.sample_interval
+
+        def extract_single(ts):
+            temp_path = os.path.join(self.frame_dir, f"{safe_name}_temp_{int(ts * 1000)}.jpg")
+            frame = self._extract_frame_safe(abs_video_path, ts, temp_path)
+            return (ts, frame, temp_path)
+
         key_frames = []
         prev_frame = None
         prev_gray = None
 
-        timestamp = 0.0
-        while timestamp < duration and len(key_frames) < self.max_frames_per_video:
-            temp_path = os.path.join(self.frame_dir, f"{safe_name}_temp_{int(timestamp * 1000)}.jpg")
+        with ThreadPoolExecutor(max_workers=cpu_cores) as executor:
+            futures = {executor.submit(extract_single, ts): ts for ts in timestamps_to_extract}
+            results = []
+            for future in as_completed(futures):
+                results.append(future.result())
 
-            current_frame = self._extract_frame_safe(abs_video_path, timestamp, temp_path)
+        results.sort(key=lambda x: x[0])
 
+        for ts, current_frame, temp_path in results:
             if current_frame is not None:
                 current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
 
@@ -689,10 +714,10 @@ class VideoProcessor:
                     diff = self._calculate_scene_diff(prev_frame, current_frame)
                     if diff >= self.diff_threshold:
                         should_save = True
-                        print(f"   📍 场景切换 @ {timestamp:.1f}s (差异: {diff:.3f})")
+                        print(f"   场景切换 @ {ts:.1f}s (差异: {diff:.3f})")
 
                 if should_save:
-                    final_path = os.path.join(self.frame_dir, f"{safe_name}_kf_{int(timestamp)}.jpg")
+                    final_path = os.path.join(self.frame_dir, f"{safe_name}_kf_{int(ts)}.jpg")
 
                     if temp_path != final_path:
                         try:
@@ -703,8 +728,8 @@ class VideoProcessor:
                             print(f"[WARN] 文件重命名失败: {e}")
                             final_path = temp_path
 
-                    start_time, end_time = self._calculate_time_range(timestamp, duration)
-                    key_frames.append((final_path, timestamp, start_time, end_time, video_info))
+                    start_time, end_time = self._calculate_time_range(ts, duration)
+                    key_frames.append((final_path, ts, start_time, end_time, video_info))
 
                 else:
                     try:
@@ -715,8 +740,6 @@ class VideoProcessor:
 
                 prev_frame = current_frame
                 prev_gray = current_gray
-
-            timestamp += self.sample_interval
 
         print(f"[STAT] 关键帧提取完成: {len(key_frames)} 个")
         return key_frames

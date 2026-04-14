@@ -38,13 +38,16 @@ async def search_videos(request: SearchRequest):
         search_results = []
         for r in results:
             distance = r.get("distance", 0.0)
-            similarity = max(0, int((1 - distance) * 100))
+            match_score = round(max(0.0, (1.0 - distance / 2.0) * 100.0), 1)
+
+            if match_score < 30.0:
+                continue
 
             if request.filters:
                 filters = request.filters
-                if filters.min_score and similarity < filters.min_score:
+                if filters.min_score and match_score < filters.min_score:
                     continue
-                if filters.max_score and similarity > filters.max_score:
+                if filters.max_score and match_score > filters.max_score:
                     continue
                 if filters.shot_size and filters.shot_size not in r.get("shot_size", ""):
                     continue
@@ -60,9 +63,9 @@ async def search_videos(request: SearchRequest):
                 timestamp=r.get("timestamp", 0.0),
                 start_time=r.get("start_time", 0.0),
                 end_time=r.get("end_time", 0.0),
-                score=similarity
+                match_score=match_score
             ))
-            print(f"   → 距离:{distance:.3f} → 匹配度:{similarity:.1f}%")
+            print(f"   -> 距离:{distance:.3f} -> 匹配度:{match_score:.1f}%")
 
         return SearchResponse(
             query=query,

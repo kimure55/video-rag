@@ -264,8 +264,8 @@ function App() {
   }
 
   const getScorePercentage = (score) => {
-    if (score === undefined || score === null) return '0'
-    return Math.max(0, Math.min(100, score)).toFixed(0)
+    if (score === undefined || score === null) return '0.0'
+    return Math.max(0, Math.min(100, score)).toFixed(1)
   }
 
   const handleBrowse = async () => {
@@ -731,7 +731,7 @@ function App() {
                           </button>
                         </div>
                         <div className="match-badge">
-                          {getScorePercentage(result.score)}% 匹配
+                          {getScorePercentage(result.match_score)}% 匹配
                         </div>
                       </div>
                       <div className="card-info">
