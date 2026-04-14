@@ -69,12 +69,13 @@ class ChromaService:
             raise
 
     def _create_collection_with_hnsw(self):
-        print("[CONFIG] 创建 Collection")
+        print("[CONFIG] 创建 Collection (cosine similarity)")
         collection = self.chroma_client.get_or_create_collection(
             name=self.collection_name,
             metadata={
                 "description": "Video frame descriptions for semantic search",
-                "embedding_dimension": 768
+                "embedding_dimension": 768,
+                "hnsw:space": "cosine"
             }
         )
         print("[OK] 新数据库已创建")
@@ -252,8 +253,8 @@ class ChromaService:
             search_results = []
             if results and results["ids"] and len(results["ids"]) > 0:
                 for i in range(len(results["ids"][0])):
-                    distance = float(results["distances"][0][i]) if results.get("distances") else 2.0
-                    match_score = round(max(0.0, (1.0 - distance / 2.0) * 100.0), 1)
+                    distance = float(results["distances"][0][i]) if results.get("distances") else 1.0
+                    match_score = round(max(0.0, (1.0 - distance) * 100.0), 1)
 
                     if match_score >= min_score:
                         search_results.append({
@@ -379,7 +380,14 @@ class OllamaService:
         if not base64_str:
             return self._empty_description()
 
-        prompt = """你是一位专业影视摄影师。请用一段自然的行业术语描述这个画面，切记不要使用"1.景别 2.光影"这种死板编号格式。必须包含：主体的动作表情、画面的影调氛围（冷/暖/高反差等）、以及镜头传达的情绪。如果画面有文字请记录。"""
+        prompt = """你是一位专业影视摄影师。请用一段自然的行业术语描述这个画面。
+
+严格按以下格式开头（必须包含方括号）：
+[有/无人物] [室内/室外] [时间] [主要场景]
+
+然后用一段连贯的话描述：主体的动作表情、画面的影调氛围（冷/暖/高反差等）、以及镜头传达的情绪。如果画面有文字请记录。
+
+禁止使用"1.景别 2.光影"这种编号格式。""".replace("\n", " ").strip()
 
         payload = {
             "model": self.model,

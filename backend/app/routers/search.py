@@ -6,6 +6,45 @@ from app.services.singleton import get_chroma_service
 
 router = APIRouter()
 
+QUERY_EXPANSION = {
+    "空镜": "纯场景镜头，无人出现，建筑，自然风光，空旷室内，环境氛围，没有人物",
+    "环境": "环境镜头，场景描写，无人物，纯风景，室内外环境",
+    "风景": "自然风景，室外场景，山水树木天空，没有人物",
+    "室内": "室内场景，房间内景，家具陈设，没有户外",
+    "人物": "有人物镜头，主角出现，演员表演，对话场景",
+    "夜景": "夜晚场景，灯光照明，暗光环境，夜景氛围",
+    "日景": "白天场景，阳光充足，日间拍摄，明亮光线",
+}
+
+BLACKLIST_PEOPLE = ["人物", "主角", "演员", "人脸", "人", "有人", "男子", "女子", "小孩", "多人"]
+BLACKLIST_HARD = ["人脸", "人物", "主角", "演员"]
+
+def expand_query(query: str) -> str:
+    original = query
+    for keyword, expansion in QUERY_EXPANSION.items():
+        if keyword in query:
+            query = expansion
+            break
+    if query != original:
+        print(f"[QUERY] 扩展: '{original}' -> '{query}'")
+    return query
+
+def is_people_shot(query: str, description: str) -> bool:
+    q_lower = query.lower()
+    if any(kw in q_lower for kw in ["空镜", "环境", "风景", "室内"]):
+        desc_lower = description.lower()
+        return any(bl in desc_lower for bl in BLACKLIST_HARD)
+    return False
+
+def score_adjustment(query: str, description: str) -> float:
+    q_lower = query.lower()
+    if any(kw in q_lower for kw in ["空镜", "环境", "风景", "室内"]):
+        desc_lower = description.lower()
+        for bl in BLACKLIST_PEOPLE:
+            if bl in desc_lower:
+                return -50.0
+    return 0.0
+
 
 class ErrorResponse(BaseModel):
     error: str
@@ -16,20 +55,22 @@ class ErrorResponse(BaseModel):
 
 @router.post("/", response_model=SearchResponse)
 async def search_videos(request: SearchRequest):
-    query = request.query.strip() if request.query else ""
+    original_query = request.query.strip() if request.query else ""
 
-    if not query:
-        return ErrorResponse(error="搜索词不能为空", query=query)
+    if not original_query:
+        return ErrorResponse(error="搜索词不能为空", query=original_query)
 
     try:
         chroma_service = get_chroma_service()
 
         if not chroma_service.model_ready:
-            return ErrorResponse(error="搜索模型未就绪，请检查后端日志", query=query)
+            return ErrorResponse(error="搜索模型未就绪，请检查后端日志", query=original_query)
 
+        expanded_query = expand_query(original_query)
         top_k = request.top_k or 20
-        results = chroma_service.search(query=query, top_k=top_k)
+        results = chroma_service.search(query=expanded_query, top_k=top_k * 2)
 
+        print(f"[SEARCH] 原始: '{original_query}' -> 扩展: '{expanded_query}'")
         print(f"[SEARCH] 搜索返回 {len(results)} 条结果")
         if results:
             raw_dist = results[0].get('distance')
@@ -38,7 +79,16 @@ async def search_videos(request: SearchRequest):
         search_results = []
         for r in results:
             distance = r.get("distance", 0.0)
-            match_score = round(max(0.0, (1.0 - distance / 2.0) * 100.0), 1)
+            match_score = round(max(0.0, (1.0 - distance) * 100.0), 1)
+
+            description = r.get("description", "")
+
+            if is_people_shot(original_query, description):
+                match_score = 0.0
+
+            adjustment = score_adjustment(original_query, description)
+            if adjustment != 0.0:
+                match_score = max(0.0, match_score + adjustment)
 
             if match_score < 30.0:
                 continue
@@ -59,23 +109,23 @@ async def search_videos(request: SearchRequest):
             search_results.append(SearchResult(
                 video_path=r.get("video_path", ""),
                 frame_path=r.get("frame_path", ""),
-                description=r.get("description", ""),
+                description=description,
                 timestamp=r.get("timestamp", 0.0),
                 start_time=r.get("start_time", 0.0),
                 end_time=r.get("end_time", 0.0),
-                match_score=match_score
+                score=match_score
             ))
             print(f"   -> 距离:{distance:.3f} -> 匹配度:{match_score:.1f}%")
 
         return SearchResponse(
-            query=query,
+            query=original_query,
             results=search_results,
             total=len(search_results)
         )
 
     except Exception as e:
         print(f"[ERROR] 搜索错误: {e}")
-        return ErrorResponse(error=f"搜索失败: {str(e)}", query=query)
+        return ErrorResponse(error=f"搜索失败: {str(e)}", query=original_query)
 
 
 @router.get("/filters/options")

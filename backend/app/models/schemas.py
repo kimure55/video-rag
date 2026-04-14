@@ -59,7 +59,7 @@ class SearchResult(BaseModel):
     timestamp: float
     start_time: float
     end_time: float
-    match_score: float
+    score: float
 
 
 class WatchFolderRequest(BaseModel):
