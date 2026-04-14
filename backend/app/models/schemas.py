@@ -28,9 +28,21 @@ class ProcessStatus(BaseModel):
     error: Optional[str] = None
 
 
+class FilterOptions(BaseModel):
+    min_score: Optional[float] = 0.0
+    max_score: Optional[float] = 100.0
+    resolution: Optional[str] = None
+    shot_size: Optional[str] = None
+    camera_movement: Optional[str] = None
+    lighting: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+
+
 class SearchRequest(BaseModel):
     query: str
-    top_k: Optional[int] = 10
+    top_k: Optional[int] = 20
+    filters: Optional[FilterOptions] = None
 
 
 class VideoMetadata(BaseModel):
@@ -48,6 +60,16 @@ class SearchResult(BaseModel):
     start_time: float
     end_time: float
     score: float
+
+
+class WatchFolderRequest(BaseModel):
+    folder_path: str
+
+
+class WatchFolderResponse(BaseModel):
+    status: str
+    message: str
+    watch_path: str
 
 
 class SearchResponse(BaseModel):

@@ -1,28 +1,21 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import os
 
 from app.routers import process, search
-from app.services.chroma_service import ChromaService
+from app.services.singleton import init_chroma_service
+from app.services.websocket_manager import ws_manager
 
-
-chroma_service = None
 
 frames_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frames")
-
-
-def get_chroma_service() -> ChromaService:
-    global chroma_service
-    if chroma_service is None:
-        chroma_service = ChromaService()
-    return chroma_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(frames_dir, exist_ok=True)
+    init_chroma_service()
     yield
 
 
@@ -49,6 +42,19 @@ app.include_router(search.router, prefix="/search", tags=["search"])
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "Video RAG API"}
+
+
+@app.websocket("/ws/progress")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception as e:
+        print(f"[WS] WebSocket异常: {e}")
+        ws_manager.disconnect(websocket)
 
 
 if __name__ == "__main__":

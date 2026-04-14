@@ -9,3 +9,4 @@ torchvision>=0.17.0
 faiss-cpu>=1.8.0
 Pillow>=10.2.0
 pydantic>=2.6.0
+watchdog>=3.0.0
