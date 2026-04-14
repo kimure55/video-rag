@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
 
 const API_BASE = 'http://localhost:8000'
+const WS_URL = 'ws://localhost:8000/ws/progress'
 
 function App() {
   const [searchQuery, setSearchQuery] = useState('')
@@ -65,6 +66,73 @@ function App() {
       }
     }
   }, [processing, loading])
+
+  // WebSocket实时进度连接
+  useEffect(() => {
+    let ws = null
+    let wsConnected = false
+
+    const connectWs = () => {
+      try {
+        ws = new WebSocket(WS_URL)
+
+        ws.onopen = () => {
+          console.log('[WS] 已连接')
+          wsConnected = true
+        }
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data)
+            if (msg.type === 'progress' && msg.data) {
+              const data = msg.data
+              setProgressData(prev => ({
+                ...prev,
+                current_video: data.current_video || prev?.current_video,
+                current_video_index: data.current_video_index || prev?.current_video_index,
+                total_videos: data.total_videos || prev?.total_videos,
+                status: data.status || 'processing',
+                message: data.message || data.current_video,
+                processed_videos: data.processed_videos ?? prev?.processed_videos,
+                processed_frames: data.processed_frames ?? prev?.processed_frames,
+                total_frames: data.total_frames ?? prev?.total_frames
+              }))
+              if (data.status === 'completed') {
+                setProcessing(false)
+              }
+            }
+          } catch (e) {
+            console.error('[WS] 解析消息失败', e)
+          }
+        }
+
+        ws.onerror = (e) => {
+          console.error('[WS] 连接错误', e)
+        }
+
+        ws.onclose = () => {
+          console.log('[WS] 已断开')
+          wsConnected = false
+          // 自动重连
+          if (processing && !wsConnected) {
+            setTimeout(connectWs, 2000)
+          }
+        }
+      } catch (e) {
+        console.error('[WS] 创建连接失败', e)
+      }
+    }
+
+    if (processing) {
+      connectWs()
+    }
+
+    return () => {
+      if (ws) {
+        ws.close()
+      }
+    }
+  }, [processing])
 
   useEffect(() => {
     loadVideoList()

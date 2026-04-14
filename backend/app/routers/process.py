@@ -86,6 +86,18 @@ def process_videos_in_background(video_files: List[str]):
     processor = VideoProcessor()
     chroma_service = get_chroma_service()
 
+    def broadcast_ws(msg: str, data: dict):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(ws_manager.send_progress({
+                "message": msg,
+                **data
+            }))
+            loop.close()
+        except Exception as e:
+            print(f"[WS] 广播失败: {e}")
+
     total_frames = 0
     processed_videos = 0
     skipped_videos = 0
@@ -102,6 +114,11 @@ def process_videos_in_background(video_files: List[str]):
                     current_video_index=idx + 1,
                     message=f"跳过已处理: {video_name}"
                 )
+                broadcast_ws(f"跳过已处理: {video_name}", {
+                    "current_video": video_name,
+                    "current_video_index": idx + 1,
+                    "total_videos": len(video_files)
+                })
                 continue
 
             update_status(
@@ -110,6 +127,12 @@ def process_videos_in_background(video_files: List[str]):
                 current_frame_index=0,
                 status="processing"
             )
+            broadcast_ws(f"正在解析第 {idx + 1}/{len(video_files)} 个视频: {video_name}", {
+                "current_video": video_name,
+                "current_video_index": idx + 1,
+                "total_videos": len(video_files),
+                "status": "processing"
+            })
 
             try:
                 results = processor.process_video(video_path)
@@ -123,18 +146,31 @@ def process_videos_in_background(video_files: List[str]):
                 process_status["processed_videos"] = processed_videos
                 process_status["processed_frames"] = total_frames
                 process_status["current_frame_index"] = len(results)
+                broadcast_ws(f"已完成: {video_name} ({len(results)} 帧)", {
+                    "current_video": video_name,
+                    "processed_videos": processed_videos,
+                    "total_frames": total_frames,
+                    "current_frame_index": len(results)
+                })
 
             except Exception as e:
                 print(f"[ERROR] 处理视频失败 {video_path}: {e}")
                 process_status["error"] = str(e)
+                broadcast_ws(f"处理失败: {video_name}", {"error": str(e)})
                 continue
 
         process_status["status"] = "completed"
         process_status["message"] = f"处理完成: {processed_videos} 个视频, {total_frames} 帧 (跳过 {skipped_videos} 个已处理)"
+        broadcast_ws("处理完成", {
+            "status": "completed",
+            "processed_videos": processed_videos,
+            "total_frames": total_frames
+        })
 
     except Exception as e:
         process_status["status"] = "error"
         process_status["error"] = str(e)
+        broadcast_ws("处理异常", {"error": str(e)})
     finally:
         process_status["is_processing"] = False
 
